@@ -1,5 +1,6 @@
 package com.scylladb.cdc.lib;
 
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -39,8 +40,18 @@ class LocalTransport implements MasterTransport, WorkerTransport {
     private Worker currentWorker = null;
     private Thread workerThread = null;
 
-    // Track generation IDs by table for tablet mode
-    protected final Map<TableName, GenerationMetadata> currentGenerationByTable = new ConcurrentHashMap<>();
+    // Helper class to store generation metadata and latest consumed timestamp
+    protected static class TableGenerationState {
+        public GenerationMetadata generationMetadata;
+        public Optional<Timestamp> maxConsumedTimestamp = Optional.empty();
+
+        public TableGenerationState(GenerationMetadata generationMetadata) {
+            this.generationMetadata = generationMetadata;
+        }
+    }
+
+    // Track generation state by table for tablet mode
+    protected final Map<TableName, TableGenerationState> currentGenerationByTable = new ConcurrentHashMap<>();
 
     public LocalTransport(ThreadGroup cdcThreadGroup, WorkerConfiguration.Builder workerConfigurationBuilder,
                           Supplier<ScheduledExecutorService> executorServiceSupplier) {
@@ -56,11 +67,11 @@ class LocalTransport implements MasterTransport, WorkerTransport {
 
     @Override
     public Optional<GenerationId> getCurrentGenerationId(TableName tableName) {
-        GenerationMetadata metadata = currentGenerationByTable.get(tableName);
-        if (metadata == null) {
+        TableGenerationState state = currentGenerationByTable.get(tableName);
+        if (state == null) {
             return Optional.empty();
         }
-        return Optional.of(metadata.getId());
+        return Optional.of(state.generationMetadata.getId());
     }
 
     @Override
@@ -126,7 +137,7 @@ class LocalTransport implements MasterTransport, WorkerTransport {
         }
 
         // Update generation metadata for this table
-        currentGenerationByTable.put(tableName, workerTasks.getGenerationMetadata());
+        currentGenerationByTable.put(tableName, new TableGenerationState(workerTasks.getGenerationMetadata()));
 
         if (currentWorker == null) {
             // No worker exists, start a new one
@@ -180,11 +191,16 @@ class LocalTransport implements MasterTransport, WorkerTransport {
     @Override
     public void setState(TaskId task, TaskState newState) {
         taskStates.put(task, newState);
+
+        Optional<Timestamp> lastConsumed = newState.getLastConsumedChangeDate().map(Timestamp::new);
+        if (lastConsumed.isPresent()) {
+            updateMaxConsumedTimestamp(task.getTable(), task.getGenerationId(), lastConsumed.get());
+        }
     }
 
     @Override
     public void moveStateToNextWindow(TaskId task, TaskState newState) {
-        taskStates.put(task, newState);
+        setState(task, newState);
     }
 
     private void stopWorkerThread() throws InterruptedException {
@@ -210,20 +226,50 @@ class LocalTransport implements MasterTransport, WorkerTransport {
 
     @Override
     public void updateGenerationMetadata(TableName table, GenerationMetadata metadata) {
-        if (!metadata.getId().equals(currentGenerationByTable.get(table).getId())) {
-            throw new IllegalArgumentException("Cannot update generation metadata for table " + table + " with a different ID: " + metadata.getId());
-        }
-        logger.atFine().log("Updating generation metadata for table %s: %s", table, metadata);
-        currentGenerationByTable.put(table, metadata);
+        currentGenerationByTable.compute(table, (tbl, state) -> {
+            if (state == null) {
+                return new TableGenerationState(metadata);
+            }
+            if (!metadata.getId().equals(state.generationMetadata.getId())) {
+                throw new IllegalArgumentException("Cannot update generation metadata for table " + table + " with a different ID: " + metadata.getId());
+            }
+            logger.atFine().log("Updating generation metadata for table %s: %s", table, metadata);
+            state.generationMetadata = metadata;
+            return state;
+        });
     }
 
     @Override
     public Optional<Timestamp> getTableEndTimestamp(TableName table) {
         // if the table is not configured, return empty
-        GenerationMetadata metadata = currentGenerationByTable.get(table);
-        if (metadata == null) {
+        TableGenerationState state = currentGenerationByTable.get(table);
+        if (state == null) {
             return Optional.empty();
         }
-        return metadata.getEnd();
+        return state.generationMetadata.getEnd();
+    }
+
+    public void updateMaxConsumedTimestamp(TableName table, GenerationId generationId, Timestamp timestamp) {
+        currentGenerationByTable.compute(table, (tbl, state) -> {
+            if (state != null && state.generationMetadata.getId().equals(generationId)) {
+                if (!state.maxConsumedTimestamp.isPresent() || timestamp.compareTo(state.maxConsumedTimestamp.get()) > 0) {
+                    state.maxConsumedTimestamp = Optional.of(timestamp);
+                }
+            }
+            // else: ignore if generationId does not match
+            return state;
+        });
+    }
+
+    @Override
+    public Optional<Timestamp> getMaxConsumedTimestamp(TableName table, GenerationId generationId) {
+        TableGenerationState state = currentGenerationByTable.get(table);
+        if (state == null) {
+            return Optional.empty();
+        }
+        if (!state.generationMetadata.getId().equals(generationId)) {
+            throw new IllegalArgumentException("GenerationId mismatch for table " + table + ": expected " + state.generationMetadata.getId() + ", got " + generationId);
+        }
+        return state.maxConsumedTimestamp;
     }
 }

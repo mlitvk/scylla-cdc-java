@@ -198,4 +198,10 @@ public class MockMasterTransport implements MasterTransport {
         return true;
     }
 
+    @Override
+    public Optional<Timestamp> getMaxConsumedTimestamp(TableName tableName, GenerationId generationId) {
+        // TODO Auto-generated method stub
+        return Optional.empty();
+    }
+
 }
