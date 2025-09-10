@@ -12,16 +12,21 @@ import com.scylladb.cdc.model.worker.RawChange;
 import com.scylladb.cdc.model.worker.RawChangeConsumer;
 import com.scylladb.cdc.model.worker.cql.Cell;
 import net.sourceforge.argparse4j.ArgumentParsers;
+import net.sourceforge.argparse4j.impl.Arguments;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
 import sun.misc.Signal;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
+import java.util.StringJoiner;
 
 public class Main {
     public static void main(String[] args) {
@@ -30,6 +35,11 @@ public class Main {
         Namespace parsedArguments = parseArguments(args);
         String source = parsedArguments.getString("source");
         String keyspace = parsedArguments.getString("keyspace"), table = parsedArguments.getString("table");
+        String sumColumnName = parsedArguments.getString("sum");
+        boolean oneline = parsedArguments.getBoolean("oneline");
+
+        // Create a map to store sums if --sum parameter is provided
+        final Map<String, Number> partitionKeySums = sumColumnName != null ? new ConcurrentHashMap<>() : null;
 
         // Build a provider of consumers. The CDCConsumer instance
         // can be run in multi-thread setting and a separate
@@ -49,10 +59,15 @@ public class Main {
             // changes represented by this class correspond
             // 1:1 to rows in *_scylla_cdc_log table.
             RawChangeConsumer changeConsumer = change -> {
-                // Print the change. See printChange()
-                // for more information on how to
-                // access its details.
-                printChange(change);
+                if (sumColumnName != null) {
+                    // If sum mode is enabled, update the sum for the partition key
+                    updateSum(change, sumColumnName, partitionKeySums);
+                    // Print the current state of the sums map
+                    printSums(partitionKeySums);
+                } else {
+                    // Regular mode - print each change
+                    printChange(change, oneline);
+                }
                 return CompletableFuture.completedFuture(null);
             };
             return changeConsumer;
@@ -62,11 +77,23 @@ public class Main {
         // (workersCount(1)), reads changes
         // from [keyspace].[table] and passes them
         // to consumers created by changeConsumerProvider.
+
+        // create tables by splitting "table" by commas
+        String[] tableNames = table.split(",");
+        ArrayList<TableName> tables = new ArrayList<>(tableNames.length);
+        for (String tableName : tableNames) {
+            tables.add(new TableName(keyspace, tableName));
+        }
+
         try (CDCConsumer consumer = CDCConsumer.builder()
                 .addContactPoint(source)
-                .addTable(new TableName(keyspace, table))
+                //.addTable(new TableName(keyspace, table))
+                .addTables(tables)
                 .withConsumerProvider(changeConsumerProvider)
                 .withWorkersCount(1)
+                .withSleepBeforeGenerationDoneMs(1000)
+                .withConfidenceWindowSizeMs(5000)
+                .withQueryTimeWindowSizeMs(10000)
                 .build()) {
 
             // Start a consumer. You can stop it by using .stop() method
@@ -88,6 +115,163 @@ public class Main {
         }
 
         // The CDCConsumer is gracefully stopped after try-with-resources.
+    }
+
+    private static void updateSum(RawChange change, String sumColumnName, Map<String, Number> partitionKeySums) {
+        // Skip if this is not a data-modifying operation
+        RawChange.OperationType operationType = change.getOperationType();
+        if (operationType != RawChange.OperationType.ROW_UPDATE &&
+            operationType != RawChange.OperationType.ROW_INSERT &&
+            operationType != RawChange.OperationType.ROW_DELETE &&
+            operationType != RawChange.OperationType.POST_IMAGE &&
+            operationType != RawChange.OperationType.PRE_IMAGE) {
+            return;
+        }
+
+        // Get the cell value for the specified column
+        Cell cell = change.getCell(sumColumnName);
+        if (cell == null) {
+            return; // Column not present in this change
+        }
+
+        // Get the partition key as a string
+        String partitionKey = extractPartitionKey(change);
+
+        // Get the numeric value from the cell as an integer
+        Integer value = extractIntegerValue(cell);
+        if (value == null) {
+            return; // Not a numeric value or cannot be converted to integer
+        }
+
+        // Update the sum in the map
+        if (operationType == RawChange.OperationType.ROW_DELETE || operationType == RawChange.OperationType.PRE_IMAGE) {
+            // For deletions or pre-images, subtract the value
+            partitionKeySums.compute(partitionKey, (key, currentSum) -> {
+                if (currentSum == null) {
+                    return 0; // Should not happen with deletions, but handle it anyway
+                }
+
+                int result = currentSum.intValue() - value;
+                // Remove the key if the sum reaches zero
+                if (result == 0) {
+                    return null;
+                }
+                return result;
+            });
+        } else {
+            // For insertions, updates, or post-images, add the value
+            partitionKeySums.compute(partitionKey, (key, currentSum) -> {
+                if (currentSum == null) {
+                    return value;
+                }
+                return currentSum.intValue() + value;
+            });
+        }
+    }
+
+    // New method to extract integer value from a cell
+    private static Integer extractIntegerValue(Cell cell) {
+        if (cell == null) {
+            return null;
+        }
+
+        Object value = cell.getAsObject();
+
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        } else if (value instanceof String) {
+            try {
+                return Integer.parseInt((String) value);
+            } catch (NumberFormatException e) {
+                return null; // Not a valid integer
+            }
+        }
+        return null; // Not a numeric type
+    }
+
+    private static String extractPartitionKey(RawChange change) {
+        // Get the schema to identify partition key columns
+        ChangeSchema changeSchema = change.getSchema();
+        List<ChangeSchema.ColumnDefinition> nonCdcColumnDefinitions = changeSchema.getNonCdcColumnDefinitions();
+
+        StringJoiner joiner = new StringJoiner("|");
+
+        // Extract values of partition key columns
+        for (ChangeSchema.ColumnDefinition columnDefinition : nonCdcColumnDefinitions) {
+            if (columnDefinition.getBaseTableColumnKind() == ChangeSchema.ColumnKind.PARTITION_KEY) {
+                String columnName = columnDefinition.getColumnName();
+                Cell cell = change.getCell(columnName);
+                String value = cell == null ? "null" : Objects.toString(cell.getAsObject());
+                joiner.add(columnName + "=" + value);
+            }
+        }
+
+        return joiner.toString();
+    }
+
+    private static void printSums(Map<String, Number> partitionKeySums) {
+        System.out.println("┌────────────────── Current Sum by Partition Key ──────────────────┐");
+
+        if (partitionKeySums.isEmpty()) {
+            System.out.println("│ No sums available yet                                           │");
+        } else {
+            for (Map.Entry<String, Number> entry : partitionKeySums.entrySet()) {
+                String line = "│ " + entry.getKey() + ": " + entry.getValue();
+                // Ensure the line fits in the box
+                if (line.length() > 68) {
+                    line = line.substring(0, 65) + "...";
+                }
+                // Pad with spaces to align the right border
+                while (line.length() < 68) {
+                    line += " ";
+                }
+                line += "│";
+                System.out.println(line);
+            }
+        }
+
+        System.out.println("└──────────────────────────────────────────────────────────────────┘");
+        System.out.println();
+    }
+
+    private static void printChange(RawChange change, boolean oneline) {
+        if (oneline) {
+            printChangeOneLine(change);
+        } else {
+            printChange(change);
+        }
+    }
+
+    private static void printChangeOneLine(RawChange change) {
+        // Get basic change information
+        ChangeId changeId = change.getId();
+        StreamId streamId = changeId.getStreamId();
+        ChangeTime changeTime = changeId.getChangeTime();
+        RawChange.OperationType operationType = change.getOperationType();
+
+        // Format stream ID - use full 16 bytes without truncation
+        byte[] buf = new byte[16];
+        streamId.getValue().duplicate().get(buf, 0, 16);
+        String streamIdHex = BaseEncoding.base16().encode(buf);
+
+        // Format timestamp
+        String timestamp = new SimpleDateFormat("HH:mm:ss.SSS").format(changeTime.getDate());
+
+        // Build column values string
+        StringJoiner columnValues = new StringJoiner(", ");
+        ChangeSchema changeSchema = change.getSchema();
+        List<ChangeSchema.ColumnDefinition> nonCdcColumnDefinitions = changeSchema.getNonCdcColumnDefinitions();
+
+        for (ChangeSchema.ColumnDefinition columnDefinition : nonCdcColumnDefinitions) {
+            String columnName = columnDefinition.getColumnName();
+            Cell cell = change.getCell(columnName);
+            Object cellValue = cell.getAsObject();
+            columnValues.add(columnName + "=" + Objects.toString(cellValue));
+        }
+
+        // Print single line: timestamp | stream_id | operation | columns
+        System.out.printf("%s | %s | %s | %s%n", 
+            timestamp, streamIdHex, operationType.name(), columnValues.toString());
     }
 
     private static void printChange(RawChange change) {
@@ -198,6 +382,9 @@ public class Main {
         parser.addArgument("-t", "--table").required(true).help("Table name");
         parser.addArgument("-s", "--source").required(true)
                 .setDefault("127.0.0.1").help("Address of a node in source cluster");
+        parser.addArgument("--sum").required(false);
+        parser.addArgument("--oneline").action(Arguments.storeTrue())
+                .help("Print each change in a succinct single line format");
 
         try {
             return parser.parseArgs(args);
