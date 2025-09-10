@@ -26,6 +26,13 @@
             <artifactId>scylla-cdc-driver3</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!-- DataStax driver needed for integration tests -->
+        <dependency>
+            <groupId>com.datastax.cassandra</groupId>
+            <artifactId>cassandra-driver-core</artifactId>
+            <version>3.11.0</version>
+            <scope>test</scope>
+        </dependency>
      </dependencies>
     <build>
         <plugins>
