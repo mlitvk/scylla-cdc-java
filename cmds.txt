@@ -1,0 +1,4 @@
+mvn test -pl scylla-cdc-base -Dtest=com.scylladb.cdc.model.master.MasterTest
+mvn test -pl scylla-cdc-lib -Dtest=TabletsIT -Dscylla.docker.hostname=localhost -Dscylla.docker.port=9042 -Dscylla.docker.version=2025.4
+mvn integration-test -Ddocker.skip=true -Dscylla.docker.hostname=localhost -Dscylla.docker.port=9042 -Dscylla.docker.version=2025.4
+mvn test -pl scylla-cdc-driver3 -Dtest=Driver3TabletsIntegrationIT -Dgroups=integration -Ddocker.skip=true -Dscylla.docker.hostname=localhost -Dscylla.docker.port=9042 -Dscylla.docker.version=2025.4
